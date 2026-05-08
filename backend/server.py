@@ -647,6 +647,10 @@ async def clear_posts():
     await insights_col.delete_many({})
     return {"deleted": res.deleted_count}
 
+@app.get("/")
+async def home():
+    return {"message": "MedoScan backend running successfully"}
+
 
 app.include_router(api)
 
