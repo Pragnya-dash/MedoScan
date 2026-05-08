@@ -27,7 +27,9 @@ export default function Alerts() {
     }
   };
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [hours]);
+  useEffect(() => {
+  load();
+}, [hours, load]);
 
   const onRefresh = async () => {
     try {
