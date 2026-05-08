@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { Brain, Siren } from "lucide-react";
@@ -21,7 +21,7 @@ export default function Alerts() {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  // ✅ FIXED: stable function using useCallback
+  // ✅ stable function (fixes ESLint dependency issue)
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -32,12 +32,11 @@ export default function Alerts() {
     }
   }, [hours]);
 
-  // ✅ FIXED useEffect dependency
   useEffect(() => {
     load();
   }, [load]);
 
-  const onRefresh = async () => {
+  const onRefresh = useCallback(async () => {
     try {
       toast.loading("Generating AI insights with Claude…", { id: "ins" });
       const r = await refreshInsights(hours, 12);
@@ -46,7 +45,7 @@ export default function Alerts() {
     } catch {
       toast.error("Insight refresh failed", { id: "ins" });
     }
-  };
+  }, [hours, load]);
 
   return (
     <div className="min-h-screen">
@@ -59,7 +58,7 @@ export default function Alerts() {
               safety signals
             </div>
 
-            <h1 className="font-display text-3xl sm:text-4xl font-bold mt-2 tracking-tight flex items-center gap-3">
+            <h1 className="font-display text-3xl sm:text-4xl font-bold mt-2 flex items-center gap-3">
               <Siren className="w-7 h-7 text-[#e07a5f]" />
               Alerts & AI insights
             </h1>
@@ -71,10 +70,9 @@ export default function Alerts() {
 
           <div className="flex gap-2">
             <Select value={String(hours)} onValueChange={(v) => setHours(Number(v))}>
-              <SelectTrigger className="h-10 w-[160px] rounded-md bg-white">
+              <SelectTrigger className="h-10 w-[160px] bg-white">
                 <SelectValue />
               </SelectTrigger>
-
               <SelectContent>
                 <SelectItem value="24">Last 24 hours</SelectItem>
                 <SelectItem value="72">Last 72 hours</SelectItem>
@@ -83,10 +81,7 @@ export default function Alerts() {
               </SelectContent>
             </Select>
 
-            <Button
-              onClick={onRefresh}
-              className="h-10 rounded-md bg-[#2b4c59] hover:bg-[#1e353e] text-white"
-            >
+            <Button onClick={onRefresh} className="h-10 bg-[#2b4c59] text-white">
               <Brain className="w-4 h-4 mr-1.5" />
               Generate AI insights
             </Button>
@@ -96,13 +91,13 @@ export default function Alerts() {
         <div className="mt-8 grid grid-cols-1 md:grid-cols-2 gap-4">
           {loading && (
             <div className="col-span-2 p-10 text-sm text-slate-500">
-              Loading…
+              Loading...
             </div>
           )}
 
           {!loading && alerts.length === 0 && (
-            <div className="col-span-2 rounded-lg border border-dashed border-slate-300 bg-white/70 p-10 text-center text-slate-500">
-              No high-severity alerts in this window. ✧
+            <div className="col-span-2 p-10 text-center text-slate-500 border border-dashed rounded-lg">
+              No high-severity alerts in this window.
             </div>
           )}
 
@@ -112,67 +107,25 @@ export default function Alerts() {
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.03 }}
-              className={`rounded-lg border bg-white p-5 border-l-4 ${
-                a.severity === "critical"
-                  ? "border-l-[#e07a5f]"
-                  : a.severity === "high"
-                  ? "border-l-[#e5989b]"
-                  : "border-l-[#f2cc8f]"
-              }`}
+              className="rounded-lg border bg-white p-5"
             >
               <div className="flex items-center gap-2 flex-wrap">
                 <SignalBadge type={a.signal_type} />
-                <span className="font-display text-lg font-semibold capitalize">
-                  {a.drug}
-                </span>
+                <span className="font-semibold capitalize">{a.drug}</span>
                 <DeltaChip value={a.delta_pct} className="ml-auto" />
               </div>
 
               <div className="text-[11px] text-slate-500 mt-1.5">
-                {a.count} post{a.count !== 1 ? "s" : ""}{" "}
-                {a.prev_count > 0
-                  ? `vs ${a.prev_count} prior`
-                  : "(new signal)"}{" "}
-                · {a.severity.toUpperCase()} ·{" "}
+                {a.count} posts · {a.severity.toUpperCase()} ·{" "}
                 {new Date(a.latest_at).toLocaleString()}
               </div>
 
-              <div className="mt-3 rounded-md bg-[#f3f1ec] p-3 text-sm text-slate-800 flex gap-2">
-                <Brain className="w-4 h-4 text-[#2b4c59] mt-0.5 flex-shrink-0" />
-                <div>
-                  {a.ai_narrative || (
-                    <span className="text-slate-500 italic">
-                      AI insight pending — click "Generate AI insights"
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              <div className="mt-3">
-                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500 mb-1.5">
-                  reported symptoms
-                </div>
-
-                <div className="flex flex-wrap gap-1.5">
-                  {(a.top_symptoms || []).length === 0 && (
-                    <span className="text-xs text-slate-400">
-                      no aggregated symptoms
-                    </span>
-                  )}
-
-                  {(a.top_symptoms || []).map((s) => (
-                    <span
-                      key={s}
-                      className="text-[11px] px-2 py-0.5 rounded-md bg-[#e07a5f]/10 text-[#b24a2f] capitalize border border-[#e07a5f]/25"
-                    >
-                      {s}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              <div className="mt-3 text-[11px] text-slate-500">
-                sources: {(a.sources || []).join(", ") || "—"}
+              <div className="mt-3 text-sm text-slate-700">
+                {a.ai_narrative || (
+                  <span className="text-slate-400 italic">
+                    AI insight pending...
+                  </span>
+                )}
               </div>
             </motion.div>
           ))}
