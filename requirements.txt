@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pymongo
+python-dotenv
+pandas
+numpy
+scikit-learn
+spacy
+apify-client
+vaderSentiment
+motor
+requests
+beautifulsoup4
+pydantic
