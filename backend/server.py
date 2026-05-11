@@ -17,6 +17,12 @@ from pipeline import aggregate_posts, process_batch, process_post
 from insights import generate_narrative
 from seed_data import get_seed_posts
 
+from apify_ingestion import (
+    fetch_twitter_posts,
+    fetch_reddit_posts,
+    fetch_quora_posts
+)
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -644,6 +650,43 @@ async def _refresh_insights_safely(hours: int, top_n: int):
     except Exception as e:
         logger.warning("background insights refresh failed: %s", e)
 
+@api.post("/live-monitor")
+async def live_monitor(keyword: str):
+
+    all_posts = []
+
+    # Fetch live posts from all platforms
+    twitter_posts = fetch_twitter_posts(keyword)
+    reddit_posts = fetch_reddit_posts(keyword)
+    quora_posts = fetch_quora_posts(keyword)
+
+    all_posts.extend(twitter_posts)
+    all_posts.extend(reddit_posts)
+    all_posts.extend(quora_posts)
+
+    processed_count = 0
+
+    for post in all_posts:
+        try:
+            result = await process_post(
+                post,
+                ANTHROPIC_API_KEY,
+                force_llm=False
+            )
+
+            if result:
+                await _save_post(result)
+                processed_count += 1
+
+        except Exception as e:
+            logger.warning(f"Failed processing post: {e}")
+
+    return {
+        "success": True,
+        "keyword": keyword,
+        "total_fetched": len(all_posts),
+        "processed": processed_count
+    }
 
 @api.delete("/posts")
 async def clear_posts():
