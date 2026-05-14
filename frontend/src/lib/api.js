@@ -25,3 +25,5 @@ export const refreshInsights = (hours = 168, top_n = 10) =>
 export const analyzeText = (payload) =>
   api.post(`/analyze`, payload).then((r) => r.data);
 export const seedDemo = () => api.post(`/seed`).then((r) => r.data);
+export const scanNow = (payload) =>
+  api.post(`/scan`, payload, { timeout: 180000 }).then((r) => r.data);
