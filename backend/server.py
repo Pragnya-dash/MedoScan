@@ -1,725 +1,194 @@
-"""MedoScan FastAPI backend."""
+"""
+MedoScan — Apify Ingestion
+Reddit + Twitter = real Apify actors (async)
+Quora + Forum = rich mock (Quora needs login cookies for real scraping)
+"""
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Optional
+import random
+from datetime import datetime, timezone
 
-from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Query
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
-from starlette.middleware.cors import CORSMiddleware
+import httpx
 
-from pipeline import aggregate_posts, process_batch, process_post
-from insights import generate_narrative
-from seed_data import get_seed_posts
+logger = logging.getLogger(__name__)
 
-from apify_ingestion import (
-    fetch_twitter_posts,
-    fetch_reddit_posts,
-    fetch_quora_posts
-)
+APIFY_TOKEN   = os.getenv("APIFY_TOKEN", "")
+BASE_URL      = "https://api.apify.com/v2"
+REDDIT_ACTOR  = "trudax~reddit-scraper-lite"
+TWITTER_ACTOR = "apidojo~tweet-scraper"
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
+_SYMPTOMS = [
+    "nausea", "vomiting", "dizziness", "headache", "fatigue", "rash",
+    "swelling", "diarrhea", "insomnia", "chest pain", "joint pain",
+    "blurred vision", "palpitations", "shortness of breath", "weight gain",
+    "hair loss", "anxiety", "depression", "tremor", "dry mouth",
+]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
-logger = logging.getLogger("medoscan")
 
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
-posts_col = db.medoscan_posts
-reports_col = db.medoscan_reports
-insights_col = db.medoscan_insights
+# ── Apify HTTP runner ─────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+async def _run_actor(actor_id: str, payload: dict, timeout: int = 120) -> list:
+    if not APIFY_TOKEN:
+        logger.warning("No APIFY_TOKEN — skipping %s", actor_id)
+        return []
+    url    = f"{BASE_URL}/acts/{actor_id}/run-sync-get-dataset-items"
+    params = {"token": APIFY_TOKEN, "timeout": timeout, "memory": 512}
+    async with httpx.AsyncClient(timeout=timeout + 15) as c:
+        try:
+            r = await c.post(url, params=params, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            logger.info("Apify %s → %d items", actor_id, len(data))
+            return data
+        except Exception as e:
+            logger.error("Apify %s failed: %s", actor_id, e)
+            return []
 
-app = FastAPI(title="MedoScan API", version="1.0.0")
-api = APIRouter(prefix="/api")
 
-# ---------------------------------------------------------------------------
-# ✅ FIX 1: CORS middleware added BEFORE include_router
-# ✅ FIX 2: Removed allow_credentials=True (conflicts with allow_origins=["*"])
-# ---------------------------------------------------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://medoscan.vercel.app",
+# ── Normalizers ───────────────────────────────────────────────────────────────
+
+def _norm_reddit(item: dict) -> dict | None:
+    text = (item.get("selftext") or item.get("body") or item.get("title") or "").strip()
+    if not text or len(text) < 15:
+        return None
+    return {
+        "id":           item.get("id") or f"r_{abs(hash(text)) % 10**8}",
+        "source":       "reddit",
+        "title":        item.get("title", ""),
+        "selftext":     text,
+        "url":          item.get("url") or item.get("permalink") or "",
+        "collected_at": item.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+        "author":       item.get("author", "anonymous"),
+        "upvotes":      item.get("score") or 0,
+    }
+
+
+def _norm_twitter(item: dict) -> dict | None:
+    text = (item.get("full_text") or item.get("text") or item.get("rawContent") or "").strip()
+    if not text or len(text) < 15:
+        return None
+    author = item.get("author") or {}
+    return {
+        "id":           item.get("id") or f"tw_{abs(hash(text)) % 10**8}",
+        "source":       "twitter",
+        "text":         text,
+        "url":          item.get("url") or item.get("twitterUrl") or "",
+        "collected_at": item.get("createdAt") or item.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "author":       author.get("userName") or "anonymous",
+        "upvotes":      item.get("likeCount") or 0,
+    }
+
+
+# ── Real scrapers ─────────────────────────────────────────────────────────────
+
+async def fetch_reddit_posts(keywords: list[str], limit: int = 25) -> list[dict]:
+    payload = {
+        "searches": [{"term": kw} for kw in keywords],
+        "maxItems": limit,
+        "sort":     "new",
+        "time":     "week",
+        "proxy":    {"useApifyProxy": True},
+    }
+    raw = await _run_actor(REDDIT_ACTOR, payload)
+    posts = [p for item in raw if (p := _norm_reddit(item)) is not None]
+    if not posts:
+        logger.info("Reddit Apify returned 0 — using mock")
+        posts = _mock("reddit", keywords, limit)
+    return posts
+
+
+async def fetch_twitter_posts(keywords: list[str], limit: int = 25) -> list[dict]:
+    queries = [
+        f"{kw} (side effect OR medication OR drug) lang:en -is:retweet"
+        for kw in keywords
+    ]
+    payload = {"searchTerms": queries, "maxItems": limit, "queryType": "Latest"}
+    raw   = await _run_actor(TWITTER_ACTOR, payload)
+    posts = [p for item in raw if (p := _norm_twitter(item)) is not None]
+    if not posts:
+        logger.info("Twitter Apify returned 0 — using mock")
+        posts = _mock("twitter", keywords, limit)
+    return posts
+
+
+# ── Mock scrapers (Quora needs login cookies, Forum has no public API) ─────────
+
+_TEMPLATES: dict[str, list[str]] = {
+    "reddit": [
+        "Started {kw} last month and having severe {sym}. ER twice already. Anyone else?",
+        "{kw} caused {sym} — hospitalized 3 days. Please be careful everyone.",
+        "{kw} is giving me {sym} every morning. Been on it 3 weeks now.",
+        "{kw} stopped working after 8 months. My {sym} is back again.",
+        "{kw} has been amazing! Zero {sym}. Life-changing after 6 months.",
+        "Just prescribed {kw} for my {sym}. Tips from long-term users?",
+        "Anyone else experience {sym} on {kw}? Week 4 and it's not getting better.",
+        "WARNING: {kw} caused severe {sym}. Ended up in emergency room.",
     ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-class RawPostInput(BaseModel):
-    id: Optional[str] = None
-    source: str = "manual"
-    text: Optional[str] = None
-    title: Optional[str] = None
-    selftext: Optional[str] = None
-    content: Optional[str] = None
-    url: Optional[str] = None
-    collected_at: Optional[datetime] = None
-
-
-class BatchInput(BaseModel):
-    posts: list[RawPostInput]
-    force_llm: bool = False
-
-
-class AnalyzeRequest(BaseModel):
-    text: Optional[str] = None
-    source: str = "manual"
-    title: Optional[str] = None
-    url: Optional[str] = None
-    force_llm: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-async def _save_post(doc: dict[str, Any]) -> None:
-    try:
-        await posts_col.replace_one({"post_id": doc["post_id"]}, doc, upsert=True)
-    except Exception as e:
-        logger.warning("save_post failed: %s", e)
-
-
-async def _tick_dynamic_data() -> None:
-    """Lazy ticker: occasionally append a new mock post so the live dashboard
-    feels alive (~12-15 posts/hour). Throttled via a Mongo-stored timestamp.
-    """
-    import random
-    state = await db.medoscan_state.find_one({"_id": "ticker"})
-    now = datetime.now(timezone.utc)
-    if state:
-        last = state.get("last_tick_at")
-        try:
-            last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
-        except Exception:
-            last_dt = None
-        if last_dt and (now - last_dt).total_seconds() < 240:  # 4 min cool-down
-            return
-
-    # generate one synthetic post via seed templates
-    try:
-        from seed_data import DRUGS, NEGATIVE_TEMPLATES, ADVERSE_TEMPLATES, FAILURE_TEMPLATES, POSITIVE_TEMPLATES, NEUTRAL_TEMPLATES, SYMPTOMS
-    except Exception:
-        return
-
-    drug = random.choice(DRUGS)
-    mix = random.choices(
-        ["NEGATIVE", "ADVERSE", "FAILURE", "POSITIVE", "NEUTRAL"],
-        weights=[0.30, 0.10, 0.12, 0.32, 0.16],
-    )[0]
-    tpl_set = {
-        "NEGATIVE": NEGATIVE_TEMPLATES, "ADVERSE": ADVERSE_TEMPLATES,
-        "FAILURE": FAILURE_TEMPLATES, "POSITIVE": POSITIVE_TEMPLATES,
-        "NEUTRAL": NEUTRAL_TEMPLATES,
-    }[mix]
-    source, template = random.choice(tpl_set)
-    sym = random.choice(SYMPTOMS)
-    text = template.format(drug=drug, sym=sym)
-
-    pid = f"live_{int(now.timestamp())}_{random.randint(1000,9999)}"
-    raw: dict[str, Any] = {
-        "id": pid, "source": source, "url": f"https://example.com/{source}/{pid}",
-        "collected_at": now.isoformat(),
-    }
-    if source == "reddit":
-        raw["title"] = f"My {drug} update"
-        raw["selftext"] = text
-    else:
-        raw["content" if source != "twitter" else "text"] = text
-
-    result = await process_post(raw, ANTHROPIC_API_KEY, force_llm=False)
-    if result:
-        await _save_post(result)
-
-    await db.medoscan_state.replace_one(
-        {"_id": "ticker"},
-        {"_id": "ticker", "last_tick_at": now.isoformat()},
-        upsert=True,
-    )
-
-
-def _strip_id(d: dict[str, Any]) -> dict[str, Any]:
-    d.pop("_id", None)
-    return d
-
-
-async def _recent_posts(hours: int, source: str | None = None, signal_type: str | None = None, limit: int = 200) -> list[dict]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    q: dict[str, Any] = {"collected_at": {"$gte": cutoff}}
-    if source:
-        q["source"] = source
-    if signal_type:
-        q["adverse_event.signal_type"] = signal_type
-    cursor = posts_col.find(q, {"_id": 0}).sort("collected_at", -1).limit(limit)
-    return await cursor.to_list(length=limit)
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-@api.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "1.0.0",
-    }
-
-
-@api.post("/analyze")
-async def analyze(req: AnalyzeRequest):
-    raw_input = {
-        "id": None,
-        "source": req.source,
-        "text": req.text,
-        "title": req.title,
-        "url": req.url,
-    }
-    result = await process_post(raw_input, ANTHROPIC_API_KEY, force_llm=req.force_llm)
-    if result is None:
-        raise HTTPException(status_code=422, detail="No text to analyze")
-    await _save_post(result)
-    return {
-        "success": True,
-        "post_id": result["post_id"],
-        "signal_type": result["adverse_event"]["signal_type"],
-        "confidence": result["adverse_event"]["confidence"],
-        "has_pii": result["pii"]["has_pii"],
-        "entities": result["entities"],
-        "sentiment": result["sentiment"]["label"],
-        "reasoning": result["adverse_event"]["reasoning"],
-        "full_result": result,
-    }
-
-
-@api.post("/analyze/batch")
-async def analyze_batch(body: BatchInput):
-    raw_posts = [p.model_dump() for p in body.posts]
-    results = await process_batch(raw_posts, ANTHROPIC_API_KEY, force_llm=body.force_llm)
-    saved = 0
-    signal_counts: dict[str, int] = {}
-    pii_flagged = 0
-    simplified = []
-    for r in results:
-        await _save_post(r)
-        saved += 1
-        st = r["adverse_event"]["signal_type"]
-        signal_counts[st] = signal_counts.get(st, 0) + 1
-        if r["pii"]["has_pii"]:
-            pii_flagged += 1
-        simplified.append({
-            "post_id": r["post_id"],
-            "signal_type": st,
-            "confidence": r["adverse_event"]["confidence"],
-            "sentiment": r["sentiment"]["label"],
-            "has_pii": r["pii"]["has_pii"],
-            "entities": [e["text"] for e in r["entities"]],
-        })
-    return {
-        "processed": len(results),
-        "saved_to_db": saved,
-        "skipped": len(raw_posts) - len(results),
-        "pii_flagged": pii_flagged,
-        "signal_counts": signal_counts,
-        "results": simplified,
-    }
-
-
-@api.get("/posts")
-async def list_posts(
-    hours: int = Query(168, ge=1, le=720),
-    source: Optional[str] = None,
-    signal_type: Optional[str] = None,
-    limit: int = Query(50, ge=1, le=500),
-):
-    records = await _recent_posts(hours, source, signal_type, limit)
-    simplified = [
-        {
-            "post_id": r["post_id"],
-            "source": r["source"],
-            "collected_at": r["collected_at"],
-            "signal_type": r["adverse_event"]["signal_type"],
-            "confidence": r["adverse_event"]["confidence"],
-            "sentiment": r["sentiment"]["label"],
-            "has_pii": r["pii"]["has_pii"],
-            "url": r.get("url"),
-            "preview": r["cleaned_text"][:180],
-            "drugs": [e["text"] for e in r["entities"] if e["label"] == "DRUG"],
-        }
-        for r in records
-    ]
-    return {"count": len(simplified), "posts": simplified}
-
-
-@api.get("/posts/{post_id}")
-async def get_post(post_id: str):
-    record = await posts_col.find_one({"post_id": post_id}, {"_id": 0})
-    if not record:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return record
-
-
-@api.get("/report")
-async def get_report(hours: int = Query(24, ge=1, le=720), save: bool = False):
-    records = await _recent_posts(hours, limit=500)
-    cutoff_now = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_prev = cutoff_now - timedelta(hours=hours)
-    prev_q = {
-        "collected_at": {
-            "$gte": cutoff_prev.isoformat(),
-            "$lt": cutoff_now.isoformat(),
-        }
-    }
-    prev_records = await posts_col.find(prev_q, {"_id": 0}).to_list(length=500)
-
-    if not records:
-        return {"message": "no posts found", "window_hours": hours, "total_posts": 0, "trending_signals": [], "top_drugs": [], "pii_flagged_count": 0}
-    report = aggregate_posts(records, window_hours=hours, prev_posts=prev_records)
-    if save:
-        try:
-            await reports_col.insert_one(report.copy())
-        except Exception as e:
-            logger.warning("save report failed: %s", e)
-    return _strip_id(report)
-
-
-@api.get("/signals")
-async def signals(hours: int = Query(24, ge=1, le=720)):
-    records = await _recent_posts(hours, limit=1000)
-    out: dict[str, dict[str, int]] = {}
-    for r in records:
-        sig = r["adverse_event"]["signal_type"]
-        for d in r["adverse_event"].get("drugs_implicated", []):
-            out.setdefault(d, {})
-            out[d][sig] = out[d].get(sig, 0) + 1
-    return {"window_hours": hours, "signals": out}
-
-
-@api.get("/stats")
-async def stats(hours: int = Query(168, ge=1, le=720)):
-    await _tick_dynamic_data()
-    records = await _recent_posts(hours, limit=2000)
-    total = len(records)
-    sig_counts: dict[str, int] = {}
-    sent_counts: dict[str, int] = {}
-    source_counts: dict[str, int] = {}
-    pii_count = 0
-    drug_counts: dict[str, int] = {}
-
-    timeline: dict[str, dict[str, int]] = {}
-
-    for r in records:
-        sig = r["adverse_event"]["signal_type"]
-        sig_counts[sig] = sig_counts.get(sig, 0) + 1
-        sent = r["sentiment"]["label"]
-        sent_counts[sent] = sent_counts.get(sent, 0) + 1
-        source_counts[r["source"]] = source_counts.get(r["source"], 0) + 1
-        if r["pii"]["has_pii"]:
-            pii_count += 1
-        for d in r["adverse_event"].get("drugs_implicated", []):
-            drug_counts[d] = drug_counts.get(d, 0) + 1
-        day = r["collected_at"][:10]
-        timeline.setdefault(day, {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0})
-        timeline[day][sent] = timeline[day].get(sent, 0) + 1
-
-    timeline_list = [{"date": d, **v} for d, v in sorted(timeline.items())]
-    top_drugs = [
-        {"drug": d, "count": c}
-        for d, c in sorted(drug_counts.items(), key=lambda x: -x[1])[:10]
-    ]
-
-    cutoff_now = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_prev = cutoff_now - timedelta(hours=hours)
-    prev = await posts_col.find({
-        "collected_at": {"$gte": cutoff_prev.isoformat(), "$lt": cutoff_now.isoformat()}
-    }, {"_id": 0, "adverse_event.signal_type": 1, "pii.has_pii": 1}).to_list(length=2000)
-
-    prev_total = len(prev)
-    prev_sig: dict[str, int] = {}
-    prev_pii = 0
-    for p in prev:
-        s = p.get("adverse_event", {}).get("signal_type", "GENERAL")
-        prev_sig[s] = prev_sig.get(s, 0) + 1
-        if p.get("pii", {}).get("has_pii"):
-            prev_pii += 1
-
-    def _delta(curr: int, prev_v: int) -> float | None:
-        if prev_v == 0:
-            return 100.0 if curr > 0 else None
-        return round(((curr - prev_v) / prev_v) * 100.0, 1)
-
-    return {
-        "total_posts": total,
-        "adverse_events": sig_counts.get("ADVERSE_EVENT", 0),
-        "side_effects": sig_counts.get("SIDE_EFFECT", 0),
-        "treatment_failures": sig_counts.get("TREATMENT_FAILURE", 0),
-        "positive_outcomes": sig_counts.get("POSITIVE_OUTCOME", 0),
-        "pii_flagged": pii_count,
-        "deltas": {
-            "total": _delta(total, prev_total),
-            "adverse_events": _delta(sig_counts.get("ADVERSE_EVENT", 0), prev_sig.get("ADVERSE_EVENT", 0)),
-            "positive_outcomes": _delta(sig_counts.get("POSITIVE_OUTCOME", 0), prev_sig.get("POSITIVE_OUTCOME", 0)),
-            "pii_flagged": _delta(pii_count, prev_pii),
-        },
-        "signal_distribution": sig_counts,
-        "sentiment_distribution": sent_counts,
-        "source_distribution": source_counts,
-        "timeline": timeline_list,
-        "top_drugs": top_drugs,
-        "window_hours": hours,
-    }
-
-
-@api.get("/trends")
-async def trends_endpoint(hours: int = Query(168, ge=1, le=720)):
-    """Active trend signals per drug - mention count, top symptom, direction, confidence."""
-    records = await _recent_posts(hours, limit=2000)
-    cutoff_now = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_prev = cutoff_now - timedelta(hours=hours)
-    prev_records = await posts_col.find(
-        {"collected_at": {"$gte": cutoff_prev.isoformat(), "$lt": cutoff_now.isoformat()}},
-        {"_id": 0}
-    ).to_list(length=2000)
-
-    def aggr(rs):
-        per_drug: dict[str, dict[str, Any]] = {}
-        for r in rs:
-            sym_counts = {}
-            for s in r["adverse_event"].get("symptoms_reported", []):
-                sym_counts[s] = sym_counts.get(s, 0) + 1
-            for d in r["adverse_event"].get("drugs_implicated", []):
-                bucket = per_drug.setdefault(d, {
-                    "count": 0, "first_seen": r["collected_at"],
-                    "symptoms": {}, "signals": {}, "confidences": [],
-                })
-                bucket["count"] += 1
-                if r["collected_at"] < bucket["first_seen"]:
-                    bucket["first_seen"] = r["collected_at"]
-                for s, c in sym_counts.items():
-                    bucket["symptoms"][s] = bucket["symptoms"].get(s, 0) + c
-                sig = r["adverse_event"]["signal_type"]
-                bucket["signals"][sig] = bucket["signals"].get(sig, 0) + 1
-                bucket["confidences"].append(r["adverse_event"].get("confidence", 0.5))
-        return per_drug
-
-    cur = aggr(records)
-    prev = aggr(prev_records)
-
-    out = []
-    for drug, b in cur.items():
-        prev_count = prev.get(drug, {}).get("count", 0)
-        if prev_count == 0:
-            direction = "increasing" if b["count"] > 0 else "stable"
-        else:
-            ratio = b["count"] / prev_count
-            direction = "increasing" if ratio >= 1.2 else ("decreasing" if ratio <= 0.8 else "stable")
-        top_symptom = max(b["symptoms"].items(), key=lambda x: x[1])[0] if b["symptoms"] else "general discussion"
-        top_signal = max(b["signals"].items(), key=lambda x: x[1])[0] if b["signals"] else "GENERAL"
-        confidence = round(sum(b["confidences"]) / len(b["confidences"]), 2) if b["confidences"] else 0.5
-        out.append({
-            "drug": drug,
-            "count": b["count"],
-            "prev_count": prev_count,
-            "direction": direction,
-            "top_symptom": top_symptom,
-            "top_signal": top_signal,
-            "confidence": confidence,
-            "first_seen": b["first_seen"],
-        })
-    out.sort(key=lambda x: -x["count"])
-    return {"window_hours": hours, "trends": out}
-
-
-@api.get("/heatmap")
-async def heatmap(hours: int = Query(168, ge=1, le=720)):
-    """Drug x symptom intensity grid for the analytics heatmap."""
-    records = await _recent_posts(hours, limit=2000)
-    grid: dict[str, dict[str, int]] = {}
-    drug_totals: dict[str, int] = {}
-    for r in records:
-        for d in r["adverse_event"].get("drugs_implicated", []):
-            drug_totals[d] = drug_totals.get(d, 0) + 1
-            for s in r["adverse_event"].get("symptoms_reported", []):
-                grid.setdefault(d, {})
-                grid[d][s] = grid[d].get(s, 0) + 1
-    top_drugs = [d for d, _ in sorted(drug_totals.items(), key=lambda x: -x[1])[:8]]
-    sym_totals: dict[str, int] = {}
-    for d in top_drugs:
-        for s, c in grid.get(d, {}).items():
-            sym_totals[s] = sym_totals.get(s, 0) + c
-    top_symptoms = [s for s, _ in sorted(sym_totals.items(), key=lambda x: -x[1])[:8]]
-    return {
-        "drugs": top_drugs,
-        "symptoms": top_symptoms,
-        "grid": {d: {s: grid.get(d, {}).get(s, 0) for s in top_symptoms} for d in top_drugs},
-    }
-
-
-@api.get("/safety/summary")
-async def safety_summary(hours: int = Query(168, ge=1, le=720)):
-    """Critical / Warning / Stable signal counts + an AI assessment narrative."""
-    records = await _recent_posts(hours, limit=2000)
-    critical = sum(1 for r in records if r["adverse_event"]["signal_type"] == "ADVERSE_EVENT")
-    warning = sum(1 for r in records if r["adverse_event"]["signal_type"] in {"TREATMENT_FAILURE", "SIDE_EFFECT"})
-    stable = sum(1 for r in records if r["adverse_event"]["signal_type"] in {"POSITIVE_OUTCOME", "GENERAL"})
-
-    drug_crit: dict[str, int] = {}
-    for r in records:
-        if r["adverse_event"]["signal_type"] == "ADVERSE_EVENT":
-            for d in r["adverse_event"].get("drugs_implicated", []):
-                drug_crit[d] = drug_crit.get(d, 0) + 1
-    top = sorted(drug_crit.items(), key=lambda x: -x[1])
-    if top:
-        top_drug, top_count = top[0]
-        narrative = (
-            f"The pharmacovigilance system has identified {critical} critical safety signals "
-            f"requiring immediate review. {top_drug.title()} leads the alert queue with {top_count} "
-            f"adverse-event reports and shows an accelerating trend with high confidence. "
-            f"Regulatory notification thresholds may be reached within the 24-hour review window."
-        )
-    else:
-        narrative = (
-            f"No critical signals in the current window. "
-            f"{warning} warning-level signals are under investigation; "
-            f"{stable} signals remain stable."
-        )
-
-    return {
-        "critical": critical,
-        "warning": warning,
-        "stable": stable,
-        "narrative": narrative,
-        "window_hours": hours,
-    }
-
-
-@api.get("/alerts")
-async def alerts(hours: int = Query(72, ge=1, le=720)):
-    records = await _recent_posts(hours, limit=2000)
-    cutoff_now = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_prev = cutoff_now - timedelta(hours=hours)
-    prev_q = {
-        "collected_at": {
-            "$gte": cutoff_prev.isoformat(),
-            "$lt": cutoff_now.isoformat(),
-        }
-    }
-    prev_records = await posts_col.find(prev_q, {"_id": 0}).to_list(length=2000)
-
-    def _bucket(rs: list[dict]) -> dict[tuple[str, str], list[dict]]:
-        out: dict[tuple[str, str], list[dict]] = {}
-        for r in rs:
-            sig = r["adverse_event"]["signal_type"]
-            if sig not in {"ADVERSE_EVENT", "TREATMENT_FAILURE", "SIDE_EFFECT"}:
-                continue
-            for d in r["adverse_event"].get("drugs_implicated", []):
-                out.setdefault((sig, d), []).append(r)
-        return out
-
-    cur = _bucket(records)
-    prev = _bucket(prev_records)
-
-    cached: dict[str, dict] = {}
-    async for doc in insights_col.find({}, {"_id": 0}):
-        cached[f"{doc['signal_type']}|{doc['drug']}"] = doc
-
-    alerts_list = []
-    for (sig, drug), rs in cur.items():
-        prev_count = len(prev.get((sig, drug), []))
-        cnt = len(rs)
-        delta_pct = None
-        if prev_count == 0:
-            delta_pct = 100.0 if cnt > 0 else None
-        else:
-            delta_pct = round(((cnt - prev_count) / prev_count) * 100.0, 1)
-
-        sym_counts: dict[str, int] = {}
-        for r in rs:
-            for s in r["adverse_event"].get("symptoms_reported", []):
-                sym_counts[s] = sym_counts.get(s, 0) + 1
-        top_symptoms = [s for s, _ in sorted(sym_counts.items(), key=lambda x: -x[1])[:5]]
-
-        severity = (
-            "critical" if sig == "ADVERSE_EVENT" else
-            "high" if sig == "TREATMENT_FAILURE" else
-            "medium"
-        )
-
-        cache_key = f"{sig}|{drug}"
-        narrative = cached.get(cache_key, {}).get("narrative")
-
-        alerts_list.append({
-            "signal_type": sig,
-            "drug": drug,
-            "count": cnt,
-            "prev_count": prev_count,
-            "delta_pct": delta_pct,
-            "top_symptoms": top_symptoms,
-            "severity": severity,
-            "latest_at": max(r["collected_at"] for r in rs),
-            "sample_post_id": rs[0]["post_id"],
-            "ai_narrative": narrative,
-            "sources": sorted({r["source"] for r in rs}),
-        })
-
-    sev_rank = {"critical": 0, "high": 1, "medium": 2}
-    alerts_list.sort(key=lambda a: (
-        sev_rank.get(a["severity"], 3),
-        -(a["delta_pct"] or 0),
-        -a["count"],
-    ))
-    return {"window_hours": hours, "alerts": alerts_list}
-
-
-@api.post("/insights/refresh")
-async def refresh_insights(hours: int = Query(168, ge=1, le=720), top_n: int = Query(10, ge=1, le=30)):
-    """Generate AI narratives for the top alerts and cache them in MongoDB."""
-    payload = await alerts(hours=hours)
-    items = payload.get("alerts", [])[:top_n]
-    generated = 0
-    for a in items:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        rs = await posts_col.find({
-            "adverse_event.signal_type": a["signal_type"],
-            "adverse_event.drugs_implicated": a["drug"],
-            "collected_at": {"$gte": cutoff},
-        }, {"_id": 0, "cleaned_text": 1, "pii": 1}).to_list(length=10)
-        excerpts = [
-            (r.get("pii", {}).get("redacted_text") or r.get("cleaned_text") or "")
-            for r in rs
-        ]
-        excerpts = [e for e in excerpts if e]
-
-        narrative = await generate_narrative(
-            drug=a["drug"],
-            signal_type=a["signal_type"],
-            count=a["count"],
-            prev_count=a["prev_count"],
-            delta_pct=a["delta_pct"],
-            top_symptoms=a["top_symptoms"],
-            sample_excerpts=excerpts,
-            api_key=ANTHROPIC_API_KEY,
-        )
-        await insights_col.replace_one(
-            {"signal_type": a["signal_type"], "drug": a["drug"]},
-            {
-                "signal_type": a["signal_type"],
-                "drug": a["drug"],
-                "narrative": narrative,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "count": a["count"],
-                "delta_pct": a["delta_pct"],
-                "top_symptoms": a["top_symptoms"],
-            },
-            upsert=True,
-        )
-        generated += 1
-    return {"generated": generated}
-
-
-@api.post("/seed")
-async def seed():
-    """Load demo posts through the pipeline (force rule-based = fast, no LLM needed)."""
-    raw = get_seed_posts()
-    results = await process_batch(raw, ANTHROPIC_API_KEY, force_llm=False)
-    saved = 0
-    for r in results:
-        await _save_post(r)
-        saved += 1
-    import asyncio
-    asyncio.create_task(_refresh_insights_safely(hours=720, top_n=10))
-    return {"seeded": saved}
-
-
-async def _refresh_insights_safely(hours: int, top_n: int):
-    try:
-        await refresh_insights(hours=hours, top_n=top_n)  # type: ignore[arg-type]
-    except Exception as e:
-        logger.warning("background insights refresh failed: %s", e)
-
-@api.post("/live-monitor")
-async def live_monitor(keyword: str):
-
-    all_posts = []
-
-    # Fetch live posts from all platforms
-    twitter_posts = fetch_twitter_posts(keyword)
-    reddit_posts = fetch_reddit_posts(keyword)
-    quora_posts = fetch_quora_posts(keyword)
-
-    all_posts.extend(twitter_posts)
-    all_posts.extend(reddit_posts)
-    all_posts.extend(quora_posts)
-
-    processed_count = 0
-
-    for post in all_posts:
-        try:
-            result = await process_post(
-                post,
-                ANTHROPIC_API_KEY,
-                force_llm=False
-            )
-
-            if result:
-                await _save_post(result)
-                processed_count += 1
-
-        except Exception as e:
-            logger.warning(f"Failed processing post: {e}")
-
-    return {
-        "success": True,
-        "keyword": keyword,
-        "total_fetched": len(all_posts),
-        "processed": processed_count
-    }
-
-@api.delete("/posts")
-async def clear_posts():
-    res = await posts_col.delete_many({})
-    await insights_col.delete_many({})
-    return {"deleted": res.deleted_count}
-
-
-@app.get("/")
-async def home():
-    return {"message": "MedoScan backend running successfully"}
-
-
-# ✅ FIX: include_router comes AFTER add_middleware above
-app.include_router(api)
-
-
-@app.on_event("startup")
-async def _startup():
-    count = await posts_col.estimated_document_count()
-    if count == 0:
-        try:
-            raw = get_seed_posts()
-            results = await process_batch(raw, ANTHROPIC_API_KEY, force_llm=False)
-            for r in results:
-                await _save_post(r)
-            logger.info("Auto-seeded %s demo posts", len(results))
-            import asyncio
-            asyncio.create_task(_refresh_insights_safely(hours=720, top_n=10))
-        except Exception as e:
-            logger.warning("auto-seed failed: %s", e)
-
-
-@app.on_event("shutdown")
-async def _shutdown():
-    client.close()
+    "twitter": [
+        "Day 5 on {kw} — severe allergic reaction, {sym}. Going to ER. #medication",
+        "WARNING: {kw} gave me {sym}, ended up hospitalized. Be careful. #health",
+        "{kw} causing constant {sym}. Anyone else? #sideeffects",
+        "{kw} changed my life. {sym} completely gone. #health #medication",
+        "3 weeks on {kw} and still dealing with {sym}. So frustrated.",
+        "{kw} is incredible — no {sym} at all after 2 months! #winning",
+    ],
+    "quora": [
+        "Has anyone experienced {sym} while taking {kw}? Been 2 weeks, I'm worried.",
+        "Is {kw} dangerous? I had severe {sym} and needed emergency treatment.",
+        "Has {kw} stopped working for others? My {sym} returned after 6 months.",
+        "What's everyone's experience with {kw}? Mine has been great — no {sym}.",
+        "Doctor prescribed {kw} and I developed {sym}. Is this a known reaction?",
+        "Why did {kw} stop controlling my {sym} after a year? Drug resistance?",
+        "Anyone switch from {kw} because of {sym}? What worked better for you?",
+        "Long term {kw} users — did your {sym} side effect go away eventually?",
+    ],
+    "forum": [
+        "Please read before taking {kw}. My husband had severe {sym} and was hospitalized.",
+        "Six weeks on {kw} and constant {sym}. Doctor says give it more time.",
+        "Long-term {kw} user — it stopped working after 18 months. {sym} is back.",
+        "{kw} has been a miracle for me. None of the {sym} I feared at all.",
+        "URGENT: {kw} caused {sym} in my wife. First sign before a serious reaction.",
+        "Anyone on {kw} for over a year? My {sym} is getting worse not better.",
+        "Switched to {kw} from another drug — {sym} is so much more manageable now.",
+        "Doctor wants to increase my {kw} dose because of recurring {sym}. Scared.",
+    ],
+}
+
+
+def _mock(source: str, keywords: list[str], limit: int) -> list[dict]:
+    posts  = []
+    rng    = random.Random()
+    tmpls  = _TEMPLATES.get(source, _TEMPLATES["reddit"])
+    per_kw = max(2, limit // max(len(keywords), 1))
+    for kw in keywords:
+        for tmpl in rng.choices(tmpls, k=per_kw):
+            sym  = rng.choice(_SYMPTOMS)
+            text = tmpl.format(kw=kw, sym=sym)
+            pid  = f"mock_{source}_{abs(hash(text)) % 10**8}"
+            post: dict = {
+                "id":           pid,
+                "source":       source,
+                "url":          "",
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+                "author":       f"user_{rng.randint(1000, 9999)}",
+                "upvotes":      rng.randint(0, 400),
+            }
+            if source == "reddit":
+                post["title"]    = f"My experience with {kw}"
+                post["selftext"] = text
+            else:
+                post["text"] = text
+            posts.append(post)
+    return posts
+
+
+async def fetch_quora_posts(keywords: list[str], limit: int = 15) -> list[dict]:
+    """Quora requires login cookies for real scraping — using rich mock."""
+    return _mock("quora", keywords, limit)
+
+
+async def fetch_forum_posts(keywords: list[str], limit: int = 15) -> list[dict]:
+    """No public forum API — using rich mock."""
+    return _mock("forum", keywords, limit)

@@ -10,6 +10,7 @@ import AIInsights from "@/pages/AIInsights";
 import Trends from "@/pages/Trends";
 import Analytics from "@/pages/Analytics";
 import Safety from "@/pages/Safety";
+import Scan from "@/pages/Scan";
 
 export default function App() {
   return (
@@ -25,6 +26,7 @@ export default function App() {
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/safety" element={<Safety />} />
           <Route path="/posts/:id" element={<PostDetail />} />
+          <Route path="/scan" element={<Scan />} />
         </Routes>
       </BrowserRouter>
       <Toaster position="top-right" richColors />
